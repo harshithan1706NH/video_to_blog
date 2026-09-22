@@ -1,0 +1,36 @@
+import os
+import psycopg2
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+def get_db_connection():
+    connection = psycopg2.connect(
+        os.getenv("DATABASE_URL")
+    )
+    return connection
+
+
+def save_transcript(video_id, chunk_id, transcript_text):
+    connection = get_db_connection()
+    cursor = connection.cursor()
+
+    cursor.execute(
+        """
+        INSERT INTO transcripts (video_id, chunk_id, transcript_text)
+        VALUES (%s, %s, %s)
+        """,
+        (video_id, chunk_id, transcript_text)
+    )
+
+    connection.commit()
+
+    cursor.close()
+    connection.close()
+
+
+if __name__ == "__main__":
+    connection = get_db_connection()
+    print("Database connection successful!")
+    connection.close()
