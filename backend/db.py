@@ -12,16 +12,16 @@ def get_db_connection():
     return connection
 
 
-def save_transcript(video_id, chunk_id, transcript_text):
+def save_transcript(video_id, audio_chunk_id, transcript_text):
     connection = get_db_connection()
     cursor = connection.cursor()
 
     cursor.execute(
         """
-        INSERT INTO transcripts (video_id, chunk_id, transcript_text)
+INSERT INTO transcripts (video_id, audio_chunk_id, transcript_text)
         VALUES (%s, %s, %s)
         """,
-        (video_id, chunk_id, transcript_text)
+        (video_id, audio_chunk_id, transcript_text)
     )
 
     connection.commit()
