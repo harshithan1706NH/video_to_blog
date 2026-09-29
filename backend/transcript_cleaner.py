@@ -65,3 +65,15 @@ def clean_transcript(transcript):
     transcript = clean_text_format(transcript)
 
     return transcript
+def process_and_save_transcript(video_id, audio_chunk_id, raw_transcript):
+    from db import save_transcript
+
+    cleaned_transcript = clean_transcript(raw_transcript)
+
+    save_transcript(
+        video_id,
+        audio_chunk_id,
+        cleaned_transcript
+    )
+
+    return cleaned_transcript
