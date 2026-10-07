@@ -8,6 +8,10 @@ import cloudinary.uploader
 import subprocess
 import os
 import uuid
+import shutil
+from transcript_cleaner import clean_transcript
+from audio_chunker import chunk_audio
+from blog_generator import generate_blog, save_blog
 
 load_dotenv()
 
@@ -19,12 +23,22 @@ cloudinary.config(
 
 app = Flask(__name__)
 
-app.secret_key = os.getenv("FLASK_SECRET_KEY", "development-secret-key")
+app.secret_key = os.getenv(
+    "FLASK_SECRET_KEY",
+    "development-secret-key"
+)
 
 CORS(app, supports_credentials=True)
 
 FFMPEG_PATH = "ffmpeg"
 FFPROBE_PATH = "ffprobe"
+
+PARAKEET_PYTHON = os.getenv("PARAKEET_PYTHON")
+
+PARAKEET_TRANSCRIBER = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "parakeet_transcriber.py"
+)
 
 MAX_VIDEO_DURATION = 30 * 60
 
@@ -92,12 +106,15 @@ def signup():
 
         password_hash = generate_password_hash(password)
 
-        cursor.execute("""
+        cursor.execute(
+            """
             INSERT INTO users
             (name, email, password_hash)
             VALUES (%s, %s, %s)
             RETURNING user_id
-        """, (name, email, password_hash))
+            """,
+            (name, email, password_hash)
+        )
 
         user_id = cursor.fetchone()[0]
 
@@ -153,11 +170,14 @@ def login():
         connection = get_db_connection()
         cursor = connection.cursor()
 
-        cursor.execute("""
+        cursor.execute(
+            """
             SELECT user_id, name, email, password_hash
             FROM users
             WHERE email = %s
-        """, (email,))
+            """,
+            (email,)
+        )
 
         user = cursor.fetchone()
 
@@ -254,7 +274,9 @@ def get_video_duration(video_path):
     )
 
     if result.returncode != 0:
-        raise Exception("Could not determine video duration")
+        raise Exception(
+            f"Could not determine video duration: {result.stderr}"
+        )
 
     return float(result.stdout.strip())
 
@@ -287,6 +309,60 @@ def extract_audio(video_path, output_path):
         )
 
 
+def transcribe_audio_chunks(
+    chunks_folder,
+    transcripts_folder
+):
+    if not PARAKEET_PYTHON:
+        raise Exception(
+            "PARAKEET_PYTHON is not configured in .env"
+        )
+
+    if not os.path.exists(PARAKEET_PYTHON):
+        raise Exception(
+            f"Parakeet Python environment not found: "
+            f"{PARAKEET_PYTHON}"
+        )
+
+    if not os.path.exists(PARAKEET_TRANSCRIBER):
+        raise Exception(
+            f"Parakeet transcriber not found: "
+            f"{PARAKEET_TRANSCRIBER}"
+        )
+
+    os.makedirs(
+        transcripts_folder,
+        exist_ok=True
+    )
+
+    command = [
+        PARAKEET_PYTHON,
+        PARAKEET_TRANSCRIBER,
+        chunks_folder,
+        transcripts_folder
+    ]
+
+    print(
+        "Starting Parakeet transcription...",
+        flush=True
+    )
+
+    result = subprocess.run(
+        command,
+        text=True
+    )
+
+    if result.returncode != 0:
+        raise Exception(
+            "Parakeet transcription failed"
+        )
+
+    print(
+        "Parakeet transcription completed.",
+        flush=True
+    )
+
+
 @app.route("/upload", methods=["POST"])
 def upload_video():
     if not session.get("user_id"):
@@ -317,7 +393,9 @@ def upload_video():
             "message": "Only MP4 videos are supported"
         }), 400
 
-    backend_folder = os.path.dirname(os.path.abspath(__file__))
+    backend_folder = os.path.dirname(
+        os.path.abspath(__file__)
+    )
 
     upload_folder = os.path.join(
         backend_folder,
@@ -329,8 +407,15 @@ def upload_video():
         "processing"
     )
 
-    os.makedirs(upload_folder, exist_ok=True)
-    os.makedirs(processing_folder, exist_ok=True)
+    os.makedirs(
+        upload_folder,
+        exist_ok=True
+    )
+
+    os.makedirs(
+        processing_folder,
+        exist_ok=True
+    )
 
     unique_id = str(uuid.uuid4())
 
@@ -339,19 +424,24 @@ def upload_video():
         f"{unique_id}.mp4"
     )
 
-    audio_path = os.path.join(
-        processing_folder,
-        f"{unique_id}.wav"
-    )
-
     connection = None
     cursor = None
+
+    video_processing_folder = None
+    audio_path = None
+    chunks_folder = None
+    transcripts_folder = None
 
     try:
         video.save(temp_path)
 
-        duration = get_video_duration(temp_path)
-        duration_seconds = int(round(duration))
+        duration = get_video_duration(
+            temp_path
+        )
+
+        duration_seconds = int(
+            round(duration)
+        )
 
         if duration_seconds > MAX_VIDEO_DURATION:
             os.remove(temp_path)
@@ -368,17 +458,15 @@ def upload_video():
             folder="blog_videos"
         )
 
-        video_url = cloudinary_result.get("secure_url")
-
-        extract_audio(
-            temp_path,
-            audio_path
+        video_url = cloudinary_result.get(
+            "secure_url"
         )
 
         connection = get_db_connection()
         cursor = connection.cursor()
 
-        cursor.execute("""
+        cursor.execute(
+            """
             INSERT INTO videos
             (
                 user_id,
@@ -389,23 +477,208 @@ def upload_video():
             )
             VALUES (%s, %s, %s, %s, %s)
             RETURNING video_id, uploaded_at
-        """, (
-            session.get("user_id"),
-            filename,
-            "mp4",
-            duration_seconds,
-            video_url
-        ))
+            """,
+            (
+                session.get("user_id"),
+                filename,
+                "mp4",
+                duration_seconds,
+                video_url
+            )
+        )
 
         video_id, uploaded_at = cursor.fetchone()
 
         connection.commit()
 
+        video_processing_folder = os.path.join(
+            processing_folder,
+            f"video_{video_id}"
+        )
+
+        os.makedirs(
+            video_processing_folder,
+            exist_ok=True
+        )
+
+        audio_path = os.path.join(
+            video_processing_folder,
+            "audio.wav"
+        )
+
+        extract_audio(
+            temp_path,
+            audio_path
+        )
+
         os.remove(temp_path)
+
+        chunks_folder = os.path.join(
+            video_processing_folder,
+            "chunks"
+        )
+
+        chunks = chunk_audio(
+            audio_path,
+            chunks_folder,
+            duration_seconds
+        )
+
+        for chunk in chunks:
+            cursor.execute(
+                """
+                INSERT INTO audio_chunks
+                (
+                    video_id,
+                    chunk_number,
+                    start_time_seconds,
+                    end_time_seconds,
+                    chunk_filename
+                )
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING audio_chunk_id
+                """,
+                (
+                    video_id,
+                    chunk["chunk_number"],
+                    chunk["start_time_seconds"],
+                    chunk["end_time_seconds"],
+                    chunk["filename"]
+                )
+            )
+
+            chunk["audio_chunk_id"] = cursor.fetchone()[0]
+
+        connection.commit()
+
+        transcripts_folder = os.path.join(
+            video_processing_folder,
+            "transcripts"
+        )
+
+        transcribe_audio_chunks(
+            chunks_folder,
+            transcripts_folder
+        )
+
+        transcript_parts = []
+
+        for chunk in chunks:
+            transcript_filename = (
+                f"chunk_{chunk['chunk_number']:03d}.txt"
+            )
+
+            transcript_path = os.path.join(
+                transcripts_folder,
+                transcript_filename
+            )
+
+            if not os.path.exists(
+                transcript_path
+            ):
+                raise Exception(
+                    f"Transcript not created for "
+                    f"{chunk['filename']}"
+                )
+
+            with open(
+                transcript_path,
+                "r",
+                encoding="utf-8"
+            ) as file:
+                transcript_text = file.read().strip()
+
+            cursor.execute(
+                """
+                INSERT INTO transcripts
+                (
+                    video_id,
+                    transcript_text,
+                    audio_chunk_id
+                )
+                VALUES (%s, %s, %s)
+                """,
+                (
+                    video_id,
+                    transcript_text,
+                    chunk["audio_chunk_id"]
+                )
+            )
+
+            transcript_parts.append(
+                transcript_text
+            )
+
+        connection.commit()
+
+        combined_transcript = "\n\n".join(
+            transcript_parts
+        )
+
+        combined_path = os.path.join(
+            transcripts_folder,
+            "combined_transcript.txt"
+        )
+
+        with open(
+            combined_path,
+            "w",
+            encoding="utf-8"
+        ) as file:
+            file.write(combined_transcript)
+
+        cleaned_transcript = clean_transcript(
+            combined_transcript
+        )
+
+        cursor.execute(
+            """
+            UPDATE videos
+            SET combined_transcript = %s,
+                cleaned_transcript = %s
+            WHERE video_id = %s
+            """,
+            (
+                combined_transcript,
+                cleaned_transcript,
+                video_id
+            )
+        )
+
+        connection.commit()
+
+        print(
+            "Generating blog with Ollama...",
+            flush=True
+        )
+
+        title, content = generate_blog(
+            cleaned_transcript
+        )
+
+        print(
+            "Saving generated blog...",
+            flush=True
+        )
+
+        blog = save_blog(
+            video_id,
+            session.get("user_id"),
+            title,
+            content
+        )
+
+        print(
+            "Blog generation completed.",
+            flush=True
+        )
 
         return jsonify({
             "success": True,
-            "message": "Video uploaded and audio extracted successfully",
+            "message": (
+                "Video uploaded, processed, transcribed, "
+                "cleaned and blog generated successfully"
+            ),
             "video": {
                 "video_id": video_id,
                 "filename": filename,
@@ -414,7 +687,27 @@ def upload_video():
                 "cloudinary_url": video_url,
                 "uploaded_at": uploaded_at.isoformat()
             },
-            "audio_path": audio_path
+            "audio_path": audio_path,
+            "chunks": [
+                {
+                    "audio_chunk_id": chunk["audio_chunk_id"],
+                    "chunk_number": chunk["chunk_number"],
+                    "start_time_seconds": chunk["start_time_seconds"],
+                    "end_time_seconds": chunk["end_time_seconds"],
+                    "chunk_filename": chunk["filename"]
+                }
+                for chunk in chunks
+            ],
+            "transcript_path": combined_path,
+            "transcript": combined_transcript,
+            "cleaned_transcript": cleaned_transcript,
+            "blog": {
+                "blog_id": blog["blog_id"],
+                "title": blog["title"],
+                "content": blog["content"],
+                "created_at": blog["created_at"].isoformat(),
+                "updated_at": blog["updated_at"].isoformat()
+            }
         }), 200
 
     except Exception as e:
@@ -424,8 +717,12 @@ def upload_video():
         if os.path.exists(temp_path):
             os.remove(temp_path)
 
-        if os.path.exists(audio_path):
-            os.remove(audio_path)
+        if video_processing_folder and os.path.exists(
+            video_processing_folder
+        ):
+            shutil.rmtree(
+                video_processing_folder
+            )
 
         return jsonify({
             "success": False,
@@ -442,4 +739,7 @@ def upload_video():
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    app.run(
+        debug=True,
+        port=5000
+    )
